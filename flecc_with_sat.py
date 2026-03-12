@@ -6,6 +6,42 @@ import pandas as pd
 import timeit
 import os
 import argparse
+import signal
+import threading
+
+def solve_with_timeout(solver, timeout_seconds):
+    """
+    Solve SAT problem with timeout using threading.
+    
+    Args:
+        solver: FleccWithSat solver instance
+        timeout_seconds: Timeout in seconds
+        
+    Returns:
+        Tuple: (sat_result, assignment) or ("timeout", None) if timeout
+    """
+    result = ["timeout", None]  # Default to timeout
+    
+    def solve_thread():
+        try:
+            sat, assignment = solver.solver.solve()
+            result[0] = sat
+            result[1] = assignment
+        except Exception as e:
+            result[0] = False
+            result[1] = None
+    
+    thread = threading.Thread(target=solve_thread)
+    thread.daemon = True  # Make thread daemon so it doesn't prevent program exit
+    thread.start()
+    thread.join(timeout_seconds)
+    
+    if thread.is_alive():
+        # Timeout occurred - thread is still running but marked as daemon
+        # Return timeout indicator
+        return "timeout", None
+    
+    return result[0], result[1]
 
 class FleccWithSat:
     """A class to solve the Fixed Length Error Correcting Codes problem using SAT solvers."""
@@ -14,7 +50,8 @@ class FleccWithSat:
         self.cnf = CNF()
         self.solution = None
         self.next_aux_var = 1
-        self.alphabet =  {'0', '1', '2', '3'}
+#        self.alphabet =  {'0', '1', '2', '3'}
+        self.alphabet =  {'0', '1'}
         self.length_of_codeword = None
         self.distance_threshold = None
         self.number_of_codewords = None
@@ -22,6 +59,7 @@ class FleccWithSat:
         self.codewords = None
         self.variables_count = 0
         self.clauses_count = 0
+        self.timeout_occurred = False
     
     def set_next_aux_var(self, next_var):
         """Set the next auxiliary variable ID."""
@@ -177,7 +215,7 @@ class FleccWithSat:
 
                 self.next_aux_var = aux_var_manager.get_biggest_returned_auxvar() + 1
 
-    def solve(self, length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming"):     
+    def solve(self, length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", timeout=None):     
         # Set parameters
         self.set_next_aux_var(1)
         self.length_of_codeword = length_of_codeword
@@ -206,7 +244,16 @@ class FleccWithSat:
         self.append_formula()  
 
         # solve() returns (is_sat, assignment_list). assignment_list is indexed by var-1
-        sat, assignment = self.solver.solve()
+        if timeout is not None:
+            print(f"Solving with timeout: {timeout}s")
+            sat, assignment = solve_with_timeout(self, timeout)
+            if sat == "timeout":
+                print(f"Timeout reached after {timeout}s")
+                self.timeout_occurred = True
+                sat = False
+                assignment = None
+        else:
+            sat, assignment = self.solver.solve()
 
         if sat:
             print("Solution found!")
@@ -266,11 +313,11 @@ def validate_codewords(codewords, distance_threshold, distance_metric):
     return ok
 
 
-def solve_flecc(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", test=False, validate=False):
+def solve_flecc(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", test=False, validate=False, timeout=None):
     start = timeit.default_timer()
     
     flecc_solver = FleccWithSat()
-    flecc_solver.solve(length_of_codeword, distance_threshold, number_of_codewords, distance_metric)
+    flecc_solver.solve(length_of_codeword, distance_threshold, number_of_codewords, distance_metric, timeout)
     
     stop = timeit.default_timer()
     runtime = stop - start
@@ -312,7 +359,7 @@ def solve_flecc(length_of_codeword, distance_threshold, number_of_codewords, dis
     return flecc_solver.solution
 
 
-def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", test=False, validate=False, max_iterations=100):
+def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", test=False, validate=False, max_iterations=100, timeout=600, max_timeout_retries=1):
     """
     Solve FLECC problem using multi-SAT approach.
     
@@ -327,6 +374,8 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
         test: If True, don't save to Excel
         validate: If True, validate the solution
         max_iterations: Maximum number of iterations to prevent infinite loops
+        timeout: Time limit in seconds for each SAT solve (default: 600s)
+        max_timeout_retries: Maximum retries when timeout occurs (default: 1)
     
     Returns:
         Tuple: (max_codewords, solution_dict, all_results)
@@ -349,20 +398,40 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
     
     while iteration < max_iterations:
         iteration += 1
-        print(f"[Iteration {iteration}] Trying {current_num_codewords} codewords...", end=" ", flush=True)
+        current_timeout_retries = 0
+        timeout_occurred = False
         
-        start = timeit.default_timer()
+        while current_timeout_retries <= max_timeout_retries:
+            print(f"[Iteration {iteration}] Trying {current_num_codewords} codewords...", end=" ", flush=True)
+            
+            start = timeit.default_timer()
+            
+            flecc_solver = FleccWithSat()
+            flecc_solver.solve(length_of_codeword, distance_threshold, current_num_codewords, distance_metric, timeout)
+            
+            stop = timeit.default_timer()
+            runtime = stop - start
+            
+            is_sat = flecc_solver.solution is not None
+            status = "SAT" if is_sat else "UNSAT"
+            
+            if flecc_solver.timeout_occurred:
+                timeout_occurred = True
+                current_timeout_retries += 1
+                if current_timeout_retries <= max_timeout_retries:
+                    print(f"TIMEOUT ({runtime:.2f}s) - Retrying ({current_timeout_retries}/{max_timeout_retries})")
+                    continue
+                else:
+                    print(f"TIMEOUT ({runtime:.2f}s) - Max retries reached, treating as UNSAT")
+                    status = "TIMEOUT"
+                    is_sat = False
+            else:
+                print(f"{status} ({runtime:.2f}s)")
+                break
         
-        flecc_solver = FleccWithSat()
-        flecc_solver.solve(length_of_codeword, distance_threshold, current_num_codewords, distance_metric)
-        
-        stop = timeit.default_timer()
-        runtime = stop - start
-        
-        is_sat = flecc_solver.solution is not None
-        status = "SAT" if is_sat else "UNSAT"
-        
-        print(f"{status} ({runtime:.2f}s)")
+        # If we exhausted retries due to timeout, mark as timeout
+        if timeout_occurred and current_timeout_retries > max_timeout_retries:
+            status = "TIMEOUT"
         
         # Prepare result data for this iteration
         instance_name = f"FLECC_{length_of_codeword}_{distance_threshold}_{current_num_codewords}_{distance_metric}"
@@ -398,7 +467,7 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
             # Increment and try next
             current_num_codewords += 1
         else:
-            # UNSAT - we found the maximum
+            # UNSAT or TIMEOUT - we found the maximum
             print(f"\n{'='*70}")
             print("Multi-SAT Search Complete!")
             print(f"{'='*70}")
@@ -423,7 +492,13 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
     if not test and all_results:
         excel_file = 'FLECC_MultiSAT.xlsx'
         results_df = pd.DataFrame(all_results)
-        results_df.to_excel(excel_file, index=False)
+        if os.path.exists(excel_file):
+            existing_df = pd.read_excel(excel_file)
+            updated_df = pd.concat([existing_df, results_df], ignore_index=True)
+        else:
+            updated_df = results_df
+        
+        updated_df.to_excel(excel_file, index=False)
         print(f"Results saved to {excel_file}")
     
     return max_codewords_found, best_solution, all_results
@@ -431,14 +506,16 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
 if __name__ == "__main__":
     # Configuration - dễ dàng thay đổi các giá trị đầu vào ở đây
     config = {
-        'length_of_codeword': 5,    # Độ dài codeword
-        'distance_threshold': 3,    # Ngưỡng khoảng cách tối thiểu
-        'number_of_codewords': 4,   # Số lượng codewords
+        'length_of_codeword': 10,    # Độ dài codeword
+        'distance_threshold': 4,    # Ngưỡng khoảng cách tối thiểu
+        'number_of_codewords': 40,   # Số lượng codewords
         'distance_metric': 'lee',  # 'hamming' hoặc 'lee'
         'test': False,              # True để chạy test (không lưu Excel)
         'validate': False,          # True để kiểm tra khoảng cách
         'multi_sat': False,         # True để sử dụng multi-SAT solver
-        'max_iterations': 100       # Số lần lặp tối đa cho multi-SAT
+        'max_iterations': 50,       # Số lần lặp tối đa cho multi-SAT
+        'timeout': 600,             # Giới hạn thời gian cho mỗi lần giải SAT (giây)
+        'max_timeout_retries': 1    # Số lần thử lại tối đa khi timeout
     }
     
     # Override config với command line arguments nếu có
@@ -451,6 +528,8 @@ if __name__ == "__main__":
     parser.add_argument("--validate", action="store_true", help="Validate codeword distances")
     parser.add_argument("--multi-sat", action="store_true", help="Use multi-SAT solver to find maximum codewords")
     parser.add_argument("--max-iterations", type=int, help=f"Maximum iterations for multi-SAT (default: {config['max_iterations']})")
+    parser.add_argument("--timeout", type=int, help=f"Time limit in seconds for each SAT solve (default: {config['timeout']})")
+    parser.add_argument("--max-timeout-retries", type=int, help=f"Maximum retries when timeout occurs (default: {config['max_timeout_retries']})")
     
     args = parser.parse_args()
     
@@ -472,6 +551,10 @@ if __name__ == "__main__":
         final_config['multi_sat'] = args.multi_sat
     if args.max_iterations is not None:
         final_config['max_iterations'] = args.max_iterations
+    if args.timeout is not None:
+        final_config['timeout'] = args.timeout
+    if hasattr(args, 'max_timeout_retries') and args.max_timeout_retries is not None:
+        final_config['max_timeout_retries'] = args.max_timeout_retries
     
     # Execute appropriate solver
     if final_config['multi_sat']:
@@ -482,7 +565,9 @@ if __name__ == "__main__":
             distance_metric=final_config['distance_metric'],
             test=final_config['test'],
             validate=final_config['validate'],
-            max_iterations=final_config['max_iterations']
+            max_iterations=final_config['max_iterations'],
+            timeout=final_config['timeout'],
+            max_timeout_retries=final_config['max_timeout_retries']
         )
     else:
         solve_flecc(
@@ -491,5 +576,6 @@ if __name__ == "__main__":
             number_of_codewords=final_config['number_of_codewords'],
             distance_metric=final_config['distance_metric'],
             test=final_config['test'],
-            validate=final_config['validate']
+            validate=final_config['validate'],
+            timeout=final_config['timeout']
         )
