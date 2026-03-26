@@ -144,6 +144,28 @@ def _compute_hamming_sphere_packing_bound(alphabet_size, length_of_codeword, min
     return (q ** n) // ball_volume
 
 
+def _compute_plotkin_bound(alphabet_size, length_of_codeword, minimum_distance):
+    """Compute the Plotkin bound for q-ary codes with Hamming distance.
+    
+    If d > (q-1)*n/q, then M <= floor(q*d / (q*d - (q-1)*n)).
+    Otherwise, the bound does not apply (return infinity).
+    """
+    q = alphabet_size
+    n = length_of_codeword
+    d = minimum_distance
+    
+    threshold = ((q - 1) * n) / q
+    
+    if d > threshold:
+        numerator = q * d
+        denominator = q * d - (q - 1) * n
+        if denominator <= 0:
+            return float("inf")
+        return numerator // denominator
+    else:
+        return float("inf")
+
+
 def compute_upper_bound_max_possible_codewords(
     alphabet_size,
     length_of_codeword,
@@ -176,18 +198,31 @@ def compute_upper_bound_max_possible_codewords(
     metric = str(distance_metric).strip().lower()
 
     if metric == "hamming":
-        term_q_pow_n = q ** n
-
+        # Singleton bound: q^(n-d+1)
         exponent = n - d + 1
-        # If exponent < 0 then q^(n-d+1) is fractional (<1); use 1 as integer cap floor.
-        term_q_pow_n_minus_d_plus_1 = q ** exponent if exponent >= 0 else 1
+        singleton_bound = q ** exponent if exponent >= 0 else 1
 
+        # Hamming sphere packing bound: floor(q^n / V_q(n, t))
+        hamming_sphere_packing = _compute_hamming_sphere_packing_bound(
+            alphabet_size=q,
+            length_of_codeword=n,
+            minimum_distance=d,
+        )
+
+        # Plotkin bound: if d > (q-1)*n/q, then floor(q*d / (q*d - (q-1)*n))
+        plotkin_bound = _compute_plotkin_bound(
+            alphabet_size=q,
+            length_of_codeword=n,
+            minimum_distance=d,
+        )
+
+        # CP/MIP bound placeholder: c*M
         if c_multiplier is None:
-            term_c_times_m = float("inf")
+            cp_mip_bound = float("inf")
         else:
-            term_c_times_m = max(0, math.ceil(c_multiplier * m))
+            cp_mip_bound = max(0, math.ceil(c_multiplier * m))
 
-        return int(min(term_q_pow_n, term_q_pow_n_minus_d_plus_1, term_c_times_m))
+        return int(min(singleton_bound, hamming_sphere_packing, plotkin_bound, cp_mip_bound))
 
     if metric == "lee":
         half_alphabet = q // 2
@@ -1148,8 +1183,8 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
 if __name__ == "__main__":
     # Configuration - dễ dàng thay đổi các giá trị đầu vào ở đây
     config = {
-        'length_of_codeword': 7,    # Độ dài codeword
-        'distance_threshold': 3,    # Ngưỡng khoảng cách tối thiểu
+        'length_of_codeword': 10,    # Độ dài codeword
+        'distance_threshold': 4,    # Ngưỡng khoảng cách tối thiểu
         'number_of_codewords': 2,   # Số lượng codewords
         'alphabet_size': 2,         # q: kích thước bảng chữ cái (0..q-1)
         'distance_metric': 'hamming',  # 'hamming' hoặc 'lee'
