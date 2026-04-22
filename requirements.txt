@@ -5,8 +5,9 @@ pypblib>=0.0.4  # Pseudo-Boolean constraint encoding library
 
 # Optimization libraries
 #ortools>=9.7.0  # Google OR-Tools for network flow
-#cplex>=22.1.0  # IBM CPLEX (optional, requires license)
+cplex>=22.1.1.0 # IBM CPLEX (optional, requires license)
 #pulp>=2.7.0  # Alternative to CPLEX - easier to install
+gurobipy>=12.0.3  # Gurobi Python API (requires a valid Gurobi license)
 scipy>=1.9.0  # For optimization algorithms
 
 # Data processing and utilities

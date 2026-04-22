@@ -20,6 +20,18 @@ __pycache__/
 *.csv
 *.xlsx
 
+data/
+filtered_data/
+
 SPP.py
 test_lee.py
 multisat_examples.py
+gurobi.lic
+check_excel.py
+check_rows.py
+filter_instances.py
+run_folder.py
+run_instances.py
+summarize_instances.py
+test_excel_append.py
+test_timeout_fix.py

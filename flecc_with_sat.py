@@ -1,5 +1,7 @@
 from pycryptosat import Solver as CryptoMiniSat5
-from pysat.formula import CNF
+from pysat.solvers import Glucose4
+from pysat.formula import CNF, WCNF
+from pysat.examples.rc2 import RC2
 from pypblib import pblib
 from pypblib.pblib import PBConfig, AuxVarManager, VectorClauseDatabase, WeightedLit, PBConstraint, Pb2cnf
 import pandas as pd
@@ -9,46 +11,104 @@ import argparse
 import signal
 import threading
 import math
+import traceback
 
 def solve_with_timeout(solver, timeout_seconds, assumptions=None):
     """
-    Solve SAT problem with timeout using threading.
-    
+    Solve SAT problem with timeout.
+
+    Uses solve_limited(expect_interrupt=True) instead of solve() because
+    Glucose4.solve() can hold the Python GIL for complex formulas, preventing
+    any Timer/Event-based timeout from firing.  solve_limited(expect_interrupt=True)
+    explicitly releases the GIL during C-level solving, allowing a Timer thread
+    to call interrupt() at the right moment.
+
     Args:
         solver: FleccWithSat solver instance
         timeout_seconds: Timeout in seconds
-        
+
     Returns:
-        Tuple: (sat_result, assignment) or ("timeout", None) if timeout
+        Tuple: (sat_result, model) or ("timeout", None) if timeout
     """
-    result = ["timeout", None]  # Default to timeout
-    
-    def solve_thread():
+    timed_out = threading.Event()
+
+    def interrupt_callback():
+        """Called by Timer after timeout_seconds; signals the solver to stop."""
+        timed_out.set()
         try:
-            if assumptions is None:
-                sat, assignment = solver.solver.solve()
-            else:
-                try:
-                    sat, assignment = solver.solver.solve(assumptions=assumptions)
-                except TypeError:
-                    sat, assignment = solver.solver.solve(assumptions)
-            result[0] = sat
-            result[1] = assignment
-        except Exception as e:
-            result[0] = False
-            result[1] = None
-    
-    thread = threading.Thread(target=solve_thread)
-    thread.daemon = True  # Make thread daemon so it doesn't prevent program exit
-    thread.start()
-    thread.join(timeout_seconds)
-    
-    if thread.is_alive():
-        # Timeout occurred - thread is still running but marked as daemon
-        # Return timeout indicator
+            solver.solver.interrupt()
+        except AttributeError:
+            pass  # Solver doesn't support interrupt()
+
+    timer = threading.Timer(timeout_seconds, interrupt_callback)
+    timer.daemon = True
+    timer.start()
+
+    sat = None
+    model = None
+    try:
+        # solve_limited with expect_interrupt=True releases the GIL and honours
+        # interrupt() calls from other threads. Without a conf_budget/prop_budget
+        # limit the call behaves identically to a regular solve() but is
+        # interruptible. Returns None when interrupted (either via interrupt() or
+        # when a budget is exhausted).
+        assume = assumptions if assumptions is not None else []
+        sat = solver.solver.solve_limited(assume, expect_interrupt=True)
+        model = solver.solver.get_model() if sat else None
+    except Exception:
+        sat = False
+        model = None
+    finally:
+        timer.cancel()
+        # Always clear the interrupt flag so subsequent solve calls are not
+        # immediately aborted.
+        try:
+            solver.solver.clear_interrupt()
+        except AttributeError:
+            pass
+
+    if timed_out.is_set() or sat is None:
         return "timeout", None
-    
-    return result[0], result[1]
+
+    return sat, model
+
+
+def solve_rc2_with_timeout(wcnf, timeout_seconds):
+    """Run RC2 with a threading.Timer interrupt — no subprocess overhead.
+
+    Returns (model, None) on success, ("timeout", None) if the timer fires
+    before RC2 finishes, or (None, traceback_string) on an unexpected error.
+    """
+    timed_out = threading.Event()
+
+    # If the budget is already exhausted, return timeout immediately.
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        return "timeout", None
+
+    with RC2(wcnf) as rc2:
+        if timeout_seconds is not None and timeout_seconds > 0:
+            timer = threading.Timer(timeout_seconds, lambda: (timed_out.set(), rc2.interrupt()))
+            timer.daemon = True
+            timer.start()
+        else:
+            timer = None
+        try:
+            model = rc2.compute(expect_interrupt=True)
+        except Exception:
+            if timer is not None:
+                timer.cancel()
+            return None, traceback.format_exc()
+        finally:
+            if timer is not None:
+                timer.cancel()
+            try:
+                rc2.clear_interrupt()
+            except AttributeError:
+                pass
+
+        if timed_out.is_set() or (model is None and getattr(rc2, 'interrupted', False)):
+            return "timeout", None
+        return model, None
 
 
 def get_cp_mip_c_multiplier_placeholder():
@@ -222,7 +282,7 @@ def compute_upper_bound_max_possible_codewords(
         else:
             cp_mip_bound = max(0, math.ceil(c_multiplier * m))
 
-        return int(min(singleton_bound, hamming_sphere_packing, plotkin_bound, cp_mip_bound))
+        return max(1, int(min(singleton_bound, hamming_sphere_packing, plotkin_bound, cp_mip_bound)))
 
     if metric == "lee":
         half_alphabet = q // 2
@@ -246,7 +306,7 @@ def compute_upper_bound_max_possible_codewords(
             minimum_distance=d,
         )
 
-        return int(min(heuristic_singleton_1, heuristic_singleton_2, lee_sphere_packing_bound))
+        return max(1, int(min(heuristic_singleton_1, heuristic_singleton_2, lee_sphere_packing_bound)))
 
     raise ValueError(f"unknown distance metric '{distance_metric}'")
 
@@ -276,11 +336,20 @@ def append_results_to_excel_by_metric_sheet(excel_file, results_df, distance_met
         except ValueError:
             # Sheet does not exist yet.
             existing_df = pd.DataFrame()
+        except Exception:
+            # File is corrupted or not a valid Excel file; overwrite it.
+            os.remove(excel_file)
+
+    # Offset the 'Iteration' column so the counter is global across all instances.
+    offset = len(existing_df)
+    incoming = results_df.copy()
+    if "Iteration" in incoming.columns and offset > 0:
+        incoming["Iteration"] = incoming["Iteration"] + offset
 
     if existing_df.empty:
-        updated_df = results_df.copy()
+        updated_df = incoming
     else:
-        updated_df = pd.concat([existing_df, results_df], ignore_index=True)
+        updated_df = pd.concat([existing_df, incoming], ignore_index=True)
 
     if os.path.exists(excel_file):
         with pd.ExcelWriter(excel_file, mode="a", engine="openpyxl", if_sheet_exists="replace") as writer:
@@ -291,10 +360,58 @@ def append_results_to_excel_by_metric_sheet(excel_file, results_df, distance_met
 
     return sheet_name
 
+
+def append_summary_to_excel(summary_row, distance_metric):
+    """Append a single summary row to a metric-specific summary Excel file.
+
+    Files are split by metric:
+      - hamming -> FLECC_Summary_hamming.xlsx
+      - lee     -> FLECC_Summary_lee.xlsx
+    Each file uses one sheet per method, derived from summary_row['Method'].
+    """
+    metric = str(distance_metric).strip().lower()
+    if metric in {"hamming", "lee"}:
+        excel_file = f"FLECC_Summary_{metric}.xlsx"
+    else:
+        excel_file = "FLECC_Summary_other.xlsx"
+
+    # Sheet name comes from the method; Excel sheet names are capped at 31 chars.
+    method = str(summary_row.get("Method", "Other"))
+    sheet_name = method[:31]
+
+    # Write all columns except 'Method' (sheet name already encodes the method).
+    row_data = {k: v for k, v in summary_row.items() if k != "Method"}
+    summary_df = pd.DataFrame([row_data])
+    existing_df = pd.DataFrame()
+
+    if os.path.exists(excel_file):
+        try:
+            existing_df = pd.read_excel(excel_file, sheet_name=sheet_name)
+        except ValueError:
+            existing_df = pd.DataFrame()
+        except Exception:
+            # File is corrupted or not a valid Excel file; overwrite it.
+            os.remove(excel_file)
+
+    if existing_df.empty:
+        combined_df = summary_df
+    else:
+        combined_df = pd.concat([existing_df, summary_df], ignore_index=True)
+
+    if os.path.exists(excel_file):
+        with pd.ExcelWriter(excel_file, mode='a', engine='openpyxl', if_sheet_exists='replace') as writer:
+            combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    else:
+        with pd.ExcelWriter(excel_file, mode='w', engine='openpyxl') as writer:
+            combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    return excel_file, sheet_name
+
+
 class FleccWithSat:
     """A class to solve the Fixed Length Error Correcting Codes problem using SAT solvers."""
     def __init__(self, alphabet_size=2):
-        self.solver = CryptoMiniSat5()
+        self.solver = Glucose4()
         self.cnf = CNF()
         self.solution = None
         self.next_aux_var = 1
@@ -331,12 +448,20 @@ class FleccWithSat:
             self.solver.add_clause(clause)
 
     def add_xor(self, lits, rhs=False):
-        """Add an XOR constraint (native to CryptoMiniSat).
+        """Encode a 3-literal XOR constraint as CNF clauses.
 
-        lits: list of integer literals (positive for var, negative for negation)
-        rhs: boolean, parity (False for even / 0, True for odd / 1)
+        Supports only the form [a, b, xor_lit] with rhs=False, encoding:
+            xor_lit <-> (a XOR b)
+        Clauses are appended to self.cnf for batch loading into the solver.
         """
-        self.solver.add_xor_clause(lits, rhs)
+        if len(lits) == 3 and not rhs:
+            a, b, xor_lit = lits
+            self.cnf.append([ a,  b, -xor_lit])
+            self.cnf.append([-a, -b, -xor_lit])
+            self.cnf.append([-a,  b,  xor_lit])
+            self.cnf.append([ a, -b,  xor_lit])
+        else:
+            raise NotImplementedError("add_xor supports only the 3-literal form with rhs=False")
     
     def create_variables(self):
         """Create a variable for each alphabet symbol in each position of each codeword."""
@@ -375,8 +500,11 @@ class FleccWithSat:
                         var_i = self.codeword_vars[(i, k, symbol)]
                         var_j = self.codeword_vars[(j, k, symbol)]
                         xor_lit = self.allocate_variables(1)
-                        # Use native XOR constraint: xor_lit == var_i XOR var_j
-                        self.add_xor([var_i, var_j, xor_lit], False)
+                        # Encode xor_lit <-> (var_i XOR var_j) as CNF
+                        self.cnf.append([ var_i,  var_j, -xor_lit])
+                        self.cnf.append([-var_i, -var_j, -xor_lit])
+                        self.cnf.append([-var_i,  var_j,  xor_lit])
+                        self.cnf.append([ var_i, -var_j,  xor_lit])
                         xor_literals.append(xor_lit)
 
                     # pos_diff is true iff any xor_lit is true (i.e. symbols differ at this position)
@@ -497,7 +625,7 @@ class FleccWithSat:
 
                 self.next_aux_var = aux_var_manager.get_biggest_returned_auxvar() + 1
 
-    def solve(self, length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", timeout=None):     
+    def solve(self, length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", timeout=None, _global_start=None):     
         # Set parameters
         self.set_next_aux_var(1)
         self.length_of_codeword = length_of_codeword
@@ -525,29 +653,35 @@ class FleccWithSat:
         # Solve the CNF formula
         self.append_formula()  
 
-        # solve() returns (is_sat, assignment_list). assignment_list is indexed by var-1
-        if timeout is not None:
-            print(f"Solving with timeout: {timeout}s")
-            sat, assignment = solve_with_timeout(self, timeout)
+        # Compute remaining budget; formula-building time is counted against the budget.
+        if timeout is not None and _global_start is not None:
+            effective_timeout = max(0.0, timeout - (timeit.default_timer() - _global_start))
+        else:
+            effective_timeout = timeout
+
+        # solve() returns a bool; get_model() returns list of signed literals.
+        if effective_timeout is not None:
+            print(f"Solving with timeout: {effective_timeout:.1f}s remaining")
+            sat, model = solve_with_timeout(self, effective_timeout)
             if sat == "timeout":
-                print(f"Timeout reached after {timeout}s")
+                print(f"Timeout reached")
                 self.timeout_occurred = True
                 sat = False
-                assignment = None
+                model = None
         else:
-            sat, assignment = self.solver.solve()
+            sat = self.solver.solve()
+            model = self.solver.get_model() if sat else None
 
         if sat:
             print("Solution found!")
+            model_set = set(model) if model else set()
             self.solution = []
-            # assignment is a list of 0/1/None values; var numbers start at 1
             for i in range(self.number_of_codewords):
                 codeword = []
                 for j in range(self.length_of_codeword):
                     for symbol in self.alphabet:
                         var_id = self.codeword_vars[(i, j, symbol)]
-                        val = assignment[var_id]
-                        if val is True:
+                        if var_id in model_set:
                             codeword.append(symbol)
                             break
                 self.solution.append(''.join(codeword))
@@ -580,6 +714,7 @@ class FleccWithSatIncremental(FleccWithSat):
         self.distance_threshold = distance_threshold
         self.distance_metric = distance_metric
         self.current_num_codewords = 0
+        self.clauses_count = 0
 
         if max_possible_codewords is not None:
             if max_possible_codewords <= 0:
@@ -621,9 +756,22 @@ class FleccWithSatIncremental(FleccWithSat):
                         self.cnf.append([-activation_var, -symbol_vars[idx1], -symbol_vars[idx2]])
 
         # Flush base constraints to solver once.
+        self.clauses_count = len(self.cnf.clauses)
         self.append_formula()
         self.cnf = CNF()
         self.base_constraints_added = True
+
+    def _add_solver_clause(self, clause):
+        """Add one CNF clause directly to the incremental solver and track it."""
+        self.solver.add_clause(clause)
+        self.clauses_count += 1
+
+    def _add_solver_clauses(self, clauses):
+        """Add multiple CNF clauses directly to the incremental solver and track them."""
+        clauses = list(clauses)
+        for clause in clauses:
+            self.solver.add_clause(clause)
+        self.clauses_count += len(clauses)
 
     def _build_target_assumptions(self, num_codewords):
         """Build assumptions for an exact target count M.
@@ -669,13 +817,17 @@ class FleccWithSatIncremental(FleccWithSat):
                     var_i = self.codeword_vars[(i, k, symbol)]
                     var_j = self.codeword_vars[(new_idx, k, symbol)]
                     xor_lit = self.allocate_variables(1)
-                    self.solver.add_xor_clause([var_i, var_j, xor_lit], False)
+                    # Encode xor_lit <-> (var_i XOR var_j) as CNF
+                    self._add_solver_clause([ var_i,  var_j, -xor_lit])
+                    self._add_solver_clause([-var_i, -var_j, -xor_lit])
+                    self._add_solver_clause([-var_i,  var_j,  xor_lit])
+                    self._add_solver_clause([ var_i, -var_j,  xor_lit])
                     xor_literals.append(xor_lit)
 
                 pos_diff = self.allocate_variables(1)
                 for xl in xor_literals:
-                    self.solver.add_clause([-xl, pos_diff])
-                self.solver.add_clause([-pos_diff] + xor_literals)
+                    self._add_solver_clause([-xl, pos_diff])
+                self._add_solver_clause([-pos_diff] + xor_literals)
                 diff_literals.append(WeightedLit(pos_diff, 1))
 
             config = PBConfig()
@@ -684,8 +836,7 @@ class FleccWithSatIncremental(FleccWithSat):
             constraint = PBConstraint(diff_literals, pblib.GEQ, self.distance_threshold)
             pb2cnf = Pb2cnf(config)
             pb2cnf.encode(constraint, clause_database, aux_var_manager)
-            for clause in clause_database.get_clauses():
-                self.solver.add_clause(clause)
+            self._add_solver_clauses(clause_database.get_clauses())
             self.next_aux_var = aux_var_manager.get_biggest_returned_auxvar() + 1
 
     def _add_lee_constraints(self, new_idx):
@@ -696,7 +847,7 @@ class FleccWithSatIncremental(FleccWithSat):
 
         if max_lee_per_position == 0:
             if self.distance_threshold > 0:
-                self.solver.add_clause([])
+                self._add_solver_clause([])
             return
 
         def lee(s, t):
@@ -722,24 +873,24 @@ class FleccWithSatIncremental(FleccWithSat):
                                 x_j = self.codeword_vars[(new_idx, pos, k2)]
                                 supporting_pairs.append((x_i, x_j))
 
-                                self.solver.add_clause([-x_i, -x_j, y_var])
+                                self._add_solver_clause([-x_i, -x_j, y_var])
 
                     if supporting_pairs:
                         backward_clause = [-y_var]
                         for x_i, x_j in supporting_pairs:
                             pair_var = self.allocate_variables(1)
-                            self.solver.add_clause([-pair_var, x_i])
-                            self.solver.add_clause([-pair_var, x_j])
-                            self.solver.add_clause([-x_i, -x_j, pair_var])
+                            self._add_solver_clause([-pair_var, x_i])
+                            self._add_solver_clause([-pair_var, x_j])
+                            self._add_solver_clause([-x_i, -x_j, pair_var])
                             backward_clause.append(pair_var)
-                        self.solver.add_clause(backward_clause)
+                        self._add_solver_clause(backward_clause)
                     else:
-                        self.solver.add_clause([-y_var])
+                        self._add_solver_clause([-y_var])
 
                     ordered_literals.append(WeightedLit(y_var, 1))
 
                 for v in range(2, max_lee_per_position + 1):
-                    self.solver.add_clause([-y_by_threshold[v], y_by_threshold[v - 1]])
+                    self._add_solver_clause([-y_by_threshold[v], y_by_threshold[v - 1]])
 
             config = PBConfig()
             aux_var_manager = AuxVarManager(self.next_aux_var)
@@ -747,14 +898,19 @@ class FleccWithSatIncremental(FleccWithSat):
             constraint = PBConstraint(ordered_literals, pblib.GEQ, self.distance_threshold)
             pb2cnf = Pb2cnf(config)
             pb2cnf.encode(constraint, clause_database, aux_var_manager)
-            for clause in clause_database.get_clauses():
-                self.solver.add_clause(clause)
+            self._add_solver_clauses(clause_database.get_clauses())
             self.next_aux_var = aux_var_manager.get_biggest_returned_auxvar() + 1
 
-    def solve_incremental(self, num_codewords, timeout=None):
+    def solve_incremental(self, num_codewords, timeout=None, _global_start=None):
         """Solve for an exact target count using p_M assumptions."""
         if not self.base_constraints_added:
             raise RuntimeError("Call initialize_base_constraints() first.")
+
+        if num_codewords > self.max_possible_codewords:
+            raise ValueError(
+                f"num_codewords={num_codewords} exceeds max_possible_codewords={self.max_possible_codewords}. "
+                f"This limit is a count, so valid codeword indices are 0..{self.max_possible_codewords - 1}."
+            )
 
         if num_codewords < self.current_num_codewords:
             raise ValueError(
@@ -770,37 +926,344 @@ class FleccWithSatIncremental(FleccWithSat):
 
         self.number_of_codewords = num_codewords
         self.variables_count = self.next_aux_var - 1
-        self.clauses_count = 0  # Not easily tracked for incremental mode
         self.timeout_occurred = False
 
-        if timeout is not None:
-            sat, assignment = solve_with_timeout(self, timeout, assumptions=assumptions)
+        # Compute remaining budget; constraint-adding time is counted against the budget.
+        if timeout is not None and _global_start is not None:
+            effective_timeout = max(0.0, timeout - (timeit.default_timer() - _global_start))
+        else:
+            effective_timeout = timeout
+
+        if effective_timeout is not None:
+            sat, model = solve_with_timeout(self, effective_timeout, assumptions=assumptions)
             if sat == "timeout":
                 self.timeout_occurred = True
                 sat = False
-                assignment = None
+                model = None
         else:
-            try:
-                sat, assignment = self.solver.solve(assumptions=assumptions)
-            except TypeError:
-                sat, assignment = self.solver.solve(assumptions)
+            sat = self.solver.solve(assumptions=assumptions)
+            model = self.solver.get_model() if sat else None
 
         if sat:
+            model_set = set(model) if model else set()
             self.solution = []
             for i in range(num_codewords):
                 codeword = []
                 for j in range(self.length_of_codeword):
                     for symbol in self.alphabet:
                         var_id = self.codeword_vars[(i, j, symbol)]
-                        val = assignment[var_id] if var_id < len(assignment) else None
-                        if val is True:
+                        if var_id in model_set:
                             codeword.append(symbol)
                             break
                 self.solution.append(''.join(codeword))
         else:
             self.solution = None
 
-        return sat, assignment
+        return sat, model
+
+
+class FleccWithMaxSatRC2:
+    """MaxSAT FLECC solver using RC2 with selector-guarded codeword slots."""
+
+    def __init__(self, alphabet_size=2, max_possible_codewords=1):
+        self.wcnf = WCNF()
+        self.solution = None
+        self.model = None
+        self.next_aux_var = 1
+        self.alphabet_size = None
+        self.alphabet = tuple()
+        self.set_alphabet_size(alphabet_size)
+        self.length_of_codeword = None
+        self.distance_threshold = None
+        self.distance_metric = None
+        self.max_possible_codewords = max(1, int(max_possible_codewords))
+        self.min_active_codewords = 0
+        self.selector_vars = {}
+        self.pair_activation_vars = {}
+        self.codeword_vars = {}
+        self.variables_count = 0
+        self.clauses_count = 0
+        self.hard_clauses_count = 0
+        self.soft_clauses_count = 0
+        self.number_of_codewords = 0
+        self.timeout_occurred = False
+
+    def set_alphabet_size(self, alphabet_size):
+        """Set alphabet to symbols '0'..str(q-1)."""
+        if alphabet_size is None or alphabet_size < 2:
+            raise ValueError("alphabet_size (q) must be >= 2")
+        self.alphabet_size = int(alphabet_size)
+        self.alphabet = tuple(str(i) for i in range(self.alphabet_size))
+
+    def set_next_aux_var(self, next_var):
+        """Set the next auxiliary variable ID."""
+        self.next_aux_var = next_var
+
+    def allocate_variables(self, count):
+        start = self.next_aux_var
+        self.next_aux_var += count
+        return start
+
+    def add_hard_clause(self, clause, guard=None):
+        guarded_clause = list(clause)
+        if guard is not None:
+            guarded_clause = [-guard] + guarded_clause
+        self.wcnf.append(guarded_clause)
+
+    def add_soft_clause(self, clause, weight=1):
+        self.wcnf.append(list(clause), weight=weight)
+
+    def _encode_pb_constraint(self, weighted_literals, comparator, rhs, guard=None):
+        config = PBConfig()
+        aux_var_manager = AuxVarManager(self.next_aux_var)
+        clause_database = VectorClauseDatabase(config)
+        constraint = PBConstraint(weighted_literals, comparator, rhs)
+        pb2cnf = Pb2cnf(config)
+        pb2cnf.encode(constraint, clause_database, aux_var_manager)
+
+        for clause in clause_database.get_clauses():
+            self.add_hard_clause(clause, guard=guard)
+
+        self.next_aux_var = aux_var_manager.get_biggest_returned_auxvar() + 1
+
+    def _add_xor_equivalence(self, lit_a, lit_b, xor_var, guard=None):
+        clauses = [
+            [lit_a, lit_b, -xor_var],
+            [-lit_a, -lit_b, -xor_var],
+            [-lit_a, lit_b, xor_var],
+            [lit_a, -lit_b, xor_var],
+        ]
+        for clause in clauses:
+            self.add_hard_clause(clause, guard=guard)
+
+    def _get_pair_activation_var(self, i1, i2):
+        key = (i1, i2)
+        if key in self.pair_activation_vars:
+            return self.pair_activation_vars[key]
+
+        pair_var = self.allocate_variables(1)
+        selector_i1 = self.selector_vars[i1]
+        selector_i2 = self.selector_vars[i2]
+
+        self.add_hard_clause([-pair_var, selector_i1])
+        self.add_hard_clause([-pair_var, selector_i2])
+        self.add_hard_clause([-selector_i1, -selector_i2, pair_var])
+
+        self.pair_activation_vars[key] = pair_var
+        return pair_var
+
+    def create_selector_variables(self):
+        for i in range(self.max_possible_codewords):
+            self.selector_vars[i] = self.allocate_variables(1)
+
+    def create_variables(self):
+        for i in range(self.max_possible_codewords):
+            for j in range(self.length_of_codeword):
+                for symbol in self.alphabet:
+                    self.codeword_vars[(i, j, symbol)] = self.allocate_variables(1)
+
+    def create_selector_guarded_exactly_one_constraints(self):
+        for i in range(self.max_possible_codewords):
+            selector = self.selector_vars[i]
+            for j in range(self.length_of_codeword):
+                symbol_vars = [self.codeword_vars[(i, j, symbol)] for symbol in self.alphabet]
+
+                for x_var in symbol_vars:
+                    self.add_hard_clause([-x_var, selector])
+
+                self.add_hard_clause(symbol_vars, guard=selector)
+
+                for idx1 in range(len(symbol_vars)):
+                    for idx2 in range(idx1 + 1, len(symbol_vars)):
+                        self.add_hard_clause([-symbol_vars[idx1], -symbol_vars[idx2]], guard=selector)
+
+    def create_minimum_active_codewords_constraint(self):
+        if self.min_active_codewords <= 0:
+            return
+
+        weighted_literals = [WeightedLit(self.selector_vars[i], 1) for i in range(self.max_possible_codewords)]
+        self._encode_pb_constraint(weighted_literals, pblib.GEQ, self.min_active_codewords)
+
+    def create_selector_soft_clauses(self):
+        for i in range(self.max_possible_codewords):
+            self.add_soft_clause([self.selector_vars[i]], weight=1)
+
+    def create_hamming_distance_constraints(self):
+        for i1 in range(self.max_possible_codewords):
+            for i2 in range(i1 + 1, self.max_possible_codewords):
+                pair_active = self._get_pair_activation_var(i1, i2)
+                diff_literals = []
+
+                for pos in range(self.length_of_codeword):
+                    xor_literals = []
+
+                    for symbol in self.alphabet:
+                        var_i = self.codeword_vars[(i1, pos, symbol)]
+                        var_j = self.codeword_vars[(i2, pos, symbol)]
+                        xor_var = self.allocate_variables(1)
+                        self._add_xor_equivalence(var_i, var_j, xor_var, guard=pair_active)
+                        xor_literals.append(xor_var)
+
+                    pos_diff = self.allocate_variables(1)
+                    for xor_var in xor_literals:
+                        self.add_hard_clause([-xor_var, pos_diff], guard=pair_active)
+                    self.add_hard_clause([-pos_diff] + xor_literals, guard=pair_active)
+                    diff_literals.append(WeightedLit(pos_diff, 1))
+
+                self._encode_pb_constraint(diff_literals, pblib.GEQ, self.distance_threshold, guard=pair_active)
+
+    def create_lee_distance_constraints(self):
+        symbols = sorted(self.alphabet, key=int)
+        alphabet_size = len(symbols)
+        max_lee_per_position = alphabet_size // 2
+
+        if max_lee_per_position == 0:
+            if self.distance_threshold > 0 and self.max_possible_codewords >= 2:
+                for i1 in range(self.max_possible_codewords):
+                    for i2 in range(i1 + 1, self.max_possible_codewords):
+                        pair_active = self._get_pair_activation_var(i1, i2)
+                        self.add_hard_clause([], guard=pair_active)
+            return
+
+        def lee(symbol_a, symbol_b):
+            value_a = int(symbol_a)
+            value_b = int(symbol_b)
+            diff = abs(value_a - value_b)
+            return min(diff, alphabet_size - diff)
+
+        for i1 in range(self.max_possible_codewords):
+            for i2 in range(i1 + 1, self.max_possible_codewords):
+                pair_active = self._get_pair_activation_var(i1, i2)
+                ordered_literals = []
+
+                for pos in range(self.length_of_codeword):
+                    y_by_threshold = {}
+
+                    for threshold in range(1, max_lee_per_position + 1):
+                        y_var = self.allocate_variables(1)
+                        y_by_threshold[threshold] = y_var
+                        supporting_pairs = []
+
+                        for symbol_i in symbols:
+                            for symbol_j in symbols:
+                                if lee(symbol_i, symbol_j) >= threshold:
+                                    x_i = self.codeword_vars[(i1, pos, symbol_i)]
+                                    x_j = self.codeword_vars[(i2, pos, symbol_j)]
+                                    supporting_pairs.append((x_i, x_j))
+                                    self.add_hard_clause([-x_i, -x_j, y_var], guard=pair_active)
+
+                        if supporting_pairs:
+                            backward_clause = [-y_var]
+                            for x_i, x_j in supporting_pairs:
+                                pair_var = self.allocate_variables(1)
+                                self.add_hard_clause([-pair_var, x_i], guard=pair_active)
+                                self.add_hard_clause([-pair_var, x_j], guard=pair_active)
+                                self.add_hard_clause([-x_i, -x_j, pair_var], guard=pair_active)
+                                backward_clause.append(pair_var)
+                            self.add_hard_clause(backward_clause, guard=pair_active)
+                        else:
+                            self.add_hard_clause([-y_var], guard=pair_active)
+
+                        ordered_literals.append(WeightedLit(y_var, 1))
+
+                    for threshold in range(2, max_lee_per_position + 1):
+                        self.add_hard_clause([-y_by_threshold[threshold], y_by_threshold[threshold - 1]], guard=pair_active)
+
+                self._encode_pb_constraint(ordered_literals, pblib.GEQ, self.distance_threshold, guard=pair_active)
+
+    def build_formula(self, length_of_codeword, distance_threshold, min_active_codewords=0, distance_metric="hamming"):
+        self.wcnf = WCNF()
+        self.solution = None
+        self.model = None
+        self.selector_vars = {}
+        self.pair_activation_vars = {}
+        self.codeword_vars = {}
+        self.set_next_aux_var(1)
+        self.length_of_codeword = length_of_codeword
+        self.distance_threshold = distance_threshold
+        self.distance_metric = distance_metric
+        self.min_active_codewords = min_active_codewords
+        self.number_of_codewords = 0
+        self.timeout_occurred = False
+
+        self.create_selector_variables()
+        self.create_variables()
+        self.create_selector_guarded_exactly_one_constraints()
+        self.create_minimum_active_codewords_constraint()
+
+        if distance_metric == "hamming":
+            self.create_hamming_distance_constraints()
+        elif distance_metric == "lee":
+            self.create_lee_distance_constraints()
+        else:
+            raise ValueError(f"unknown distance metric '{distance_metric}'")
+
+        self.create_selector_soft_clauses()
+
+        self.variables_count = self.next_aux_var - 1
+        self.hard_clauses_count = len(self.wcnf.hard)
+        self.soft_clauses_count = len(self.wcnf.soft)
+        self.clauses_count = self.hard_clauses_count + self.soft_clauses_count
+
+    def _apply_model(self, model):
+        positive_literals = {lit for lit in model if lit > 0}
+        active_indices = [i for i in range(self.max_possible_codewords) if self.selector_vars[i] in positive_literals]
+
+        self.model = model
+        self.solution = []
+        for i in active_indices:
+            codeword = []
+            for j in range(self.length_of_codeword):
+                for symbol in self.alphabet:
+                    var_id = self.codeword_vars[(i, j, symbol)]
+                    if var_id in positive_literals:
+                        codeword.append(symbol)
+                        break
+            self.solution.append(''.join(codeword))
+
+        self.number_of_codewords = len(self.solution)
+
+    def solve(self, length_of_codeword, distance_threshold, min_active_codewords=0, distance_metric="hamming", timeout=None, _global_start=None):
+        self.build_formula(
+            length_of_codeword=length_of_codeword,
+            distance_threshold=distance_threshold,
+            min_active_codewords=min_active_codewords,
+            distance_metric=distance_metric,
+        )
+
+        # Compute remaining budget; formula-building time is counted against the budget.
+        if timeout is not None and _global_start is not None:
+            effective_timeout = max(0.0, timeout - (timeit.default_timer() - _global_start))
+        else:
+            effective_timeout = timeout
+
+        self.timeout_occurred = False
+        if effective_timeout is not None:
+            print(f"Solving MaxSAT with timeout: {effective_timeout:.1f}s remaining")
+            model, error_message = solve_rc2_with_timeout(self.wcnf, effective_timeout)
+            if model == "timeout":
+                print(f"Timeout reached after {effective_timeout:.1f}s")
+                self.timeout_occurred = True
+                self.solution = None
+                self.model = None
+                self.number_of_codewords = 0
+                return None
+            if error_message is not None:
+                raise RuntimeError(f"RC2 subprocess failed:\n{error_message}")
+        else:
+            with RC2(self.wcnf) as rc2:
+                model = rc2.compute()
+
+        if model is None:
+            print("No MaxSAT solution exists.")
+            self.solution = None
+            self.model = None
+            self.number_of_codewords = 0
+            return None
+
+        self._apply_model(model)
+        print(f"MaxSAT optimum found with {self.number_of_codewords} active codewords.")
+        return model
 
 
 def validate_codewords(codewords, distance_threshold, distance_metric, alphabet_size):
@@ -844,13 +1307,13 @@ def validate_codewords(codewords, distance_threshold, distance_metric, alphabet_
 
 
 def solve_flecc(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", alphabet_size=2, test=False, validate=False, timeout=None):
-    start = timeit.default_timer()
+    global_start = timeit.default_timer()
     
     flecc_solver = FleccWithSat(alphabet_size=alphabet_size)
-    flecc_solver.solve(length_of_codeword, distance_threshold, number_of_codewords, distance_metric, timeout)
+    flecc_solver.solve(length_of_codeword, distance_threshold, number_of_codewords, distance_metric, timeout, _global_start=global_start)
     
     stop = timeit.default_timer()
-    runtime = stop - start
+    runtime = stop - global_start
     
     print("Codewords:", flecc_solver.solution)
     print(f"Runtime: {runtime:.2f}s")
@@ -883,7 +1346,79 @@ def solve_flecc(length_of_codeword, distance_threshold, number_of_codewords, dis
     return flecc_solver.solution
 
 
-def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", alphabet_size=2, test=False, validate=False, max_iterations=100, timeout=600, max_timeout_retries=1):
+def solve_flecc_maxsat(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", alphabet_size=2, test=False, validate=False, timeout=None):
+    global_start = timeit.default_timer()
+
+    c_multiplier = get_cp_mip_c_multiplier_placeholder()
+    max_possible_codewords = compute_upper_bound_max_possible_codewords(
+        alphabet_size=alphabet_size,
+        length_of_codeword=length_of_codeword,
+        distance_threshold=distance_threshold,
+        requested_codewords=number_of_codewords,
+        distance_metric=distance_metric,
+        c_multiplier=c_multiplier,
+    )
+
+    max_possible_codewords = max(1, max_possible_codewords)
+    print(
+        f"Starting MaxSAT RC2 solver with lower bound={number_of_codewords}, "
+        f"upper bound estimate={max_possible_codewords}"
+    )
+
+    flecc_solver = FleccWithMaxSatRC2(
+        alphabet_size=alphabet_size,
+        max_possible_codewords=max_possible_codewords,
+    )
+    flecc_solver.solve(
+        length_of_codeword=length_of_codeword,
+        distance_threshold=distance_threshold,
+        min_active_codewords=number_of_codewords,
+        distance_metric=distance_metric,
+        timeout=timeout,
+        _global_start=global_start,
+    )
+
+    stop = timeit.default_timer()
+    runtime = stop - global_start
+
+    print("Codewords:", flecc_solver.solution)
+    print(f"Maximum active codewords: {flecc_solver.number_of_codewords}")
+    print(f"Runtime: {runtime:.2f}s")
+
+    if validate and flecc_solver.solution:
+        validate_codewords(flecc_solver.solution, distance_threshold, distance_metric, alphabet_size)
+
+    instance_name = f"FLECC_{length_of_codeword}_{distance_threshold}_{number_of_codewords}_{distance_metric}_maxsat"
+    codewords_str = str(flecc_solver.solution) if flecc_solver.solution else "None"
+    if flecc_solver.timeout_occurred:
+        status = "TIMEOUT"
+    else:
+        status = "OPTIMAL" if flecc_solver.solution is not None else "UNSAT"
+
+    result = {
+        'Instance': instance_name,
+        'Requested_Codewords': number_of_codewords,
+        'Max_Codewords': flecc_solver.number_of_codewords,
+        'Upper_Bound': max_possible_codewords,
+        'Variables': flecc_solver.variables_count,
+        'Hard_Clauses': flecc_solver.hard_clauses_count,
+        'Soft_Clauses': flecc_solver.soft_clauses_count,
+        'Clauses': flecc_solver.clauses_count,
+        'Runtime': runtime,
+        'Codewords': codewords_str,
+        'Status': status,
+    }
+
+    if not test:
+        excel_file = 'FLECC_MaxSAT.xlsx'
+        results_df = pd.DataFrame([result])
+        sheet_name = append_results_to_excel_by_metric_sheet(excel_file, results_df, distance_metric)
+        print(f"Results saved to {excel_file} (sheet: {sheet_name})")
+
+    return flecc_solver.solution
+
+
+def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", alphabet_size=2, test=False, validate=False, timeout=600, max_timeout_retries=1, max_vars=1_000_000):
     """
     Solve FLECC problem using multi-SAT approach.
     
@@ -897,9 +1432,9 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
         distance_metric: 'hamming' or 'lee'
         test: If True, don't save to Excel
         validate: If True, validate the solution
-        max_iterations: Maximum number of iterations to prevent infinite loops
-        timeout: Time limit in seconds for each SAT solve (default: 600s)
+        timeout: Total time budget in seconds for the whole search (default: 600s)
         max_timeout_retries: Maximum retries when timeout occurs (default: 1)
+        max_vars: Max SAT variables allowed; stops search before OOM (default: 1_000_000)
     
     Returns:
         Tuple: (max_codewords, solution_dict, all_results)
@@ -912,26 +1447,68 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
     print(f"{'='*70}")
     print(f"Lower bound (initial number of codewords): {number_of_codewords}")
     print(f"Codeword length: {length_of_codeword}, Distance threshold: {distance_threshold}")
-    print(f"Distance metric: {distance_metric}\n")
-    
+    print(f"Distance metric: {distance_metric}")
+    if timeout is not None:
+        print(f"Global timeout: {timeout}s (shared across all iterations)")
+    else:
+        print()
+
+    c_multiplier = get_cp_mip_c_multiplier_placeholder()
+    ub_max_possible_codewords = compute_upper_bound_max_possible_codewords(
+        alphabet_size=alphabet_size,
+        length_of_codeword=length_of_codeword,
+        distance_threshold=distance_threshold,
+        requested_codewords=number_of_codewords,
+        distance_metric=distance_metric,
+        c_multiplier=c_multiplier,
+    )
+    print(f"Upper bound estimate: {ub_max_possible_codewords}")
+
+    vars_per_codeword = length_of_codeword * alphabet_size
+    mem_cap = max(number_of_codewords, max_vars // max(1, vars_per_codeword * 10)) if max_vars is not None else ub_max_possible_codewords
+    effective_ub = min(ub_max_possible_codewords, mem_cap)
+    memory_limited = effective_ub < ub_max_possible_codewords
+    if memory_limited:
+        print(f"Memory cap applied (max_vars={max_vars}): max M limited to {effective_ub} (UB was {ub_max_possible_codewords})")
+    print()
+
     current_num_codewords = number_of_codewords
     max_codewords_found = None
     best_solution = None
     all_results = []
     iteration = 0
-    
-    while iteration < max_iterations:
+    global_start = timeit.default_timer()
+    summary_status = "Optimal"
+
+    while True:
+        if current_num_codewords > effective_ub:
+            if memory_limited:
+                summary_status = "MemoryLimit"
+            print(f"\n{'='*70}")
+            print("Multi-SAT Search Complete!")
+            print(f"{'='*70}")
+            if memory_limited:
+                print(f"Reached memory limit (max_vars={max_vars}): M capped at {effective_ub}")
+            else:
+                print(f"Reached upper bound estimate: {ub_max_possible_codewords}")
+            print(f"Maximum number of codewords found: {max_codewords_found}")
+            if best_solution:
+                print(f"Best solution: {best_solution['codewords']}")
+            print(f"Total iterations: {iteration}")
+            print(f"{'='*70}\n")
+            break
+
         iteration += 1
         current_timeout_retries = 0
         timeout_occurred = False
         
         while current_timeout_retries <= max_timeout_retries:
             print(f"[Iteration {iteration}] Trying {current_num_codewords} codewords...", end=" ", flush=True)
-            
+
             start = timeit.default_timer()
             
             flecc_solver = FleccWithSat(alphabet_size=alphabet_size)
-            flecc_solver.solve(length_of_codeword, distance_threshold, current_num_codewords, distance_metric, timeout)
+            flecc_solver.solve(length_of_codeword, distance_threshold, current_num_codewords, distance_metric, timeout, _global_start=global_start)
             
             stop = timeit.default_timer()
             runtime = stop - start
@@ -967,11 +1544,17 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
             'Num_Codewords': current_num_codewords,
             'Variables': flecc_solver.variables_count,
             'Clauses': flecc_solver.clauses_count,
-            'Runtime': runtime,
+            'Runtime': round(timeit.default_timer() - global_start, 4),
             'Codewords': codewords_str,
             'Status': status
         }
         all_results.append(result)
+
+        if not test:
+            excel_file = 'FLECC_MultiSAT.xlsx'
+            results_df = pd.DataFrame([result])
+            sheet_name = append_results_to_excel_by_metric_sheet(excel_file, results_df, distance_metric)
+            print(f"Iteration {iteration} saved to {excel_file} (sheet: {sheet_name})")
         
         if is_sat:
             # Solution found - update best solution and continue
@@ -992,6 +1575,8 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
             current_num_codewords += 1
         else:
             # UNSAT or TIMEOUT - we found the maximum
+            if status == "TIMEOUT":
+                summary_status = "Timeout"
             print(f"\n{'='*70}")
             print("Multi-SAT Search Complete!")
             print(f"{'='*70}")
@@ -1001,28 +1586,27 @@ def solve_flecc_multi_sat(length_of_codeword, distance_threshold, number_of_code
             print(f"Total iterations: {iteration}")
             print(f"{'='*70}\n")
             break
-    else:
-        # Loop completed without finding UNSAT (reached max_iterations)
-        print(f"\n{'='*70}")
-        print("Multi-SAT Search Stopped (max iterations reached)")
-        print(f"{'='*70}")
-        print(f"Maximum number of codewords found: {max_codewords_found}")
-        if best_solution:
-            print(f"Best solution: {best_solution['codewords']}")
-        print(f"Total iterations: {iteration}")
-        print(f"{'='*70}\n")
-    
-    # Save results to Excel if not in test mode
-    if not test and all_results:
-        excel_file = 'FLECC_MultiSAT.xlsx'
-        results_df = pd.DataFrame(all_results)
-        sheet_name = append_results_to_excel_by_metric_sheet(excel_file, results_df, distance_metric)
-        print(f"Results saved to {excel_file} (sheet: {sheet_name})")
-    
+    if not test:
+        if max_codewords_found is None and summary_status == "Optimal":
+            summary_status = "UNSAT"
+        summary_row = {
+            'Instance': f"FLECC_{length_of_codeword}_{distance_threshold}_{distance_metric}_q{alphabet_size}",
+            'n': length_of_codeword,
+            'q': alphabet_size,
+            'd': distance_threshold,
+            'M_best': max_codewords_found,
+            'UB': ub_max_possible_codewords,
+            'Time(s)': round(timeit.default_timer() - global_start, 4),
+            'Status': summary_status,
+            'Vars': best_solution['variables_count'] if best_solution else None,
+            'Method': 'MultiSAT',
+        }
+        summary_file, sheet_name = append_summary_to_excel(summary_row, distance_metric)
+        print(f"Summary saved to {summary_file} (sheet: {sheet_name})")
     return max_codewords_found, best_solution, all_results
 
 
-def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", alphabet_size=2, test=False, validate=False, max_iterations=100, timeout=600, max_timeout_retries=1):
+def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, number_of_codewords, distance_metric="hamming", alphabet_size=2, test=False, validate=False, timeout=600, max_timeout_retries=1, max_vars=1_000_000, instance_name=None):
     """
     Solve FLECC problem using incremental multi-SAT with learned clause reuse.
 
@@ -1038,9 +1622,9 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
         distance_metric: 'hamming' or 'lee'
         test: If True, don't save to Excel
         validate: If True, validate the solution
-        max_iterations: Maximum number of iterations to prevent infinite loops
-        timeout: Time limit in seconds for each SAT solve (default: 600s)
+        timeout: Total time budget in seconds for the whole search (default: 600s)
         max_timeout_retries: Maximum retries when timeout occurs (default: 1)
+        max_vars: Max SAT variables allowed; caps M before initialisation to prevent OOM (default: 1_000_000)
 
     Returns:
         Tuple: (max_codewords, solution_dict, all_results)
@@ -1051,6 +1635,8 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
     print(f"Lower bound (initial number of codewords): {number_of_codewords}")
     print(f"Codeword length: {length_of_codeword}, Distance threshold: {distance_threshold}")
     print(f"Distance metric: {distance_metric}")
+    if timeout is not None:
+        print(f"Global timeout: {timeout}s (shared across all iterations)")
     print("Learned clauses will be preserved between iterations\n")
 
     # One solver instance for the entire search.
@@ -1066,15 +1652,26 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
         c_multiplier=c_multiplier,
     )
 
-    # Keep allocation within search trajectory while respecting the UB formula.
-    trajectory_cap = number_of_codewords + max_iterations
-    max_possible_codewords = max(number_of_codewords, min(ub_max_possible_codewords, trajectory_cap))
-    print(
-        f"Upper bound estimate: UB={ub_max_possible_codewords}, "
-        f"trajectory_cap={trajectory_cap}, "
-        f"using max_possible_codewords={max_possible_codewords}"
-    )
+    # Cap allocation to avoid huge initialization for large upper bounds.
+    # Each extra slot costs O(n*q) variables + distance constraints; allocating
+    # thousands of slots up-front before any solve call hangs the process because
+    # initialize_base_constraints has no timeout.  We cap at the UB but never
+    # wider than what could plausibly be reached within the timeout budget
+    # (assume at minimum ~1 s per iteration for constraint-adding + solving).
+    if timeout is not None and timeout > 0:
+        iteration_budget = max(20, int(timeout))  # at most 1 iter/s worst case
+    else:
+        iteration_budget = 100
+    trajectory_cap = number_of_codewords + iteration_budget
+    vars_per_codeword = length_of_codeword * alphabet_size
+    mem_cap = max(number_of_codewords, max_vars // max(1, vars_per_codeword * 10)) if max_vars is not None else ub_max_possible_codewords
+    max_possible_codewords = max(number_of_codewords, min(ub_max_possible_codewords, trajectory_cap, mem_cap))
+    memory_limited = max_possible_codewords < ub_max_possible_codewords
+    print(f"Upper bound estimate: {ub_max_possible_codewords}, trajectory cap: {trajectory_cap}, using: {max_possible_codewords}")
+    if memory_limited:
+        print(f"Memory cap applied (max_vars={max_vars}): max M limited to {max_possible_codewords} (UB was {ub_max_possible_codewords})")
 
+    global_start = timeit.default_timer()
     flecc_solver.initialize_base_constraints(
         length_of_codeword,
         distance_threshold,
@@ -1087,8 +1684,27 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
     best_solution = None
     all_results = []
     iteration = 0
+    summary_status = "Optimal"
 
-    while iteration < max_iterations:
+    while True:
+        if current_num_codewords > max_possible_codewords:
+            if memory_limited:
+                summary_status = "MemoryLimit"
+            print(f"\n{'='*70}")
+            print("Incremental Multi-SAT Search Complete!")
+            print(f"{'='*70}")
+            if memory_limited:
+                print(f"Reached memory limit (max_vars={max_vars}): M capped at {max_possible_codewords}")
+            else:
+                print(f"Reached upper bound estimate: {max_possible_codewords}")
+            print(f"Maximum number of codewords found: {max_codewords_found}")
+            if best_solution:
+                print(f"Best solution: {best_solution['codewords']}")
+            print(f"Total iterations: {iteration}")
+            print("Learned clauses were preserved throughout the search")
+            print(f"{'='*70}\n")
+            break
+
         iteration += 1
         current_timeout_retries = 0
         timeout_occurred = False
@@ -1097,7 +1713,7 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
             print(f"[Iteration {iteration}] Trying {current_num_codewords} codewords...", end=" ", flush=True)
 
             start = timeit.default_timer()
-            sat, assignment = flecc_solver.solve_incremental(current_num_codewords, timeout)
+            sat, assignment = flecc_solver.solve_incremental(current_num_codewords, timeout, _global_start=global_start)
             stop = timeit.default_timer()
             runtime = stop - start
 
@@ -1121,20 +1737,26 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
         if timeout_occurred and current_timeout_retries > max_timeout_retries:
             status = "TIMEOUT"
 
-        instance_name = f"FLECC_{length_of_codeword}_{distance_threshold}_{current_num_codewords}_{distance_metric}_incremental"
+        _instance_label = instance_name if instance_name else f"FLECC_{length_of_codeword}_{distance_threshold}_{current_num_codewords}_{distance_metric}_incremental"
         codewords_str = str(flecc_solver.solution) if flecc_solver.solution else "None"
 
         result = {
             'Iteration': iteration,
-            'Instance': instance_name,
+            'Instance': _instance_label,
             'Num_Codewords': current_num_codewords,
             'Variables': flecc_solver.variables_count,
             'Clauses': flecc_solver.clauses_count,
-            'Runtime': runtime,
+            'Runtime': round(timeit.default_timer() - global_start, 4),
             'Codewords': codewords_str,
             'Status': status
         }
         all_results.append(result)
+
+        if not test:
+            excel_file = 'FLECC_MultiSAT_Incremental.xlsx'
+            results_df = pd.DataFrame([result])
+            sheet_name = append_results_to_excel_by_metric_sheet(excel_file, results_df, distance_metric)
+            print(f"Iteration {iteration} saved to {excel_file} (sheet: {sheet_name})")
 
         if is_sat:
             max_codewords_found = current_num_codewords
@@ -1151,6 +1773,8 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
 
             current_num_codewords += 1
         else:
+            if status == "TIMEOUT":
+                summary_status = "Timeout"
             print(f"\n{'='*70}")
             print("Incremental Multi-SAT Search Complete!")
             print(f"{'='*70}")
@@ -1161,21 +1785,24 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
             print("Learned clauses were preserved throughout the search")
             print(f"{'='*70}\n")
             break
-    else:
-        print(f"\n{'='*70}")
-        print("Incremental Multi-SAT Search Stopped (max iterations reached)")
-        print(f"{'='*70}")
-        print(f"Maximum number of codewords found: {max_codewords_found}")
-        if best_solution:
-            print(f"Best solution: {best_solution['codewords']}")
-        print(f"Total iterations: {iteration}")
-        print(f"{'='*70}\n")
 
-    if not test and all_results:
-        excel_file = 'FLECC_MultiSAT_Incremental.xlsx'
-        results_df = pd.DataFrame(all_results)
-        sheet_name = append_results_to_excel_by_metric_sheet(excel_file, results_df, distance_metric)
-        print(f"Results saved to {excel_file} (sheet: {sheet_name})")
+    if not test:
+        if max_codewords_found is None and summary_status == "Optimal":
+            summary_status = "UNSAT"
+        summary_row = {
+            'Instance': instance_name if instance_name else f"FLECC_{length_of_codeword}_{distance_threshold}_{distance_metric}_q{alphabet_size}",
+            'n': length_of_codeword,
+            'q': alphabet_size,
+            'd': distance_threshold,
+            'M_best': max_codewords_found,
+            'UB': ub_max_possible_codewords,
+            'Time(s)': round(timeit.default_timer() - global_start, 4),
+            'Status': summary_status,
+            'Vars': best_solution['variables_count'] if best_solution else None,
+            'Method': 'Incremental',
+        }
+        summary_file, sheet_name = append_summary_to_excel(summary_row, distance_metric)
+        print(f"Summary saved to {summary_file} (sheet: {sheet_name})")
 
     return max_codewords_found, best_solution, all_results
 
@@ -1183,18 +1810,18 @@ def solve_flecc_multi_sat_incremental(length_of_codeword, distance_threshold, nu
 if __name__ == "__main__":
     # Configuration - dễ dàng thay đổi các giá trị đầu vào ở đây
     config = {
-        'length_of_codeword': 10,    # Độ dài codeword
+        'length_of_codeword': 8,    # Độ dài codeword
         'distance_threshold': 4,    # Ngưỡng khoảng cách tối thiểu
         'number_of_codewords': 2,   # Số lượng codewords
         'alphabet_size': 2,         # q: kích thước bảng chữ cái (0..q-1)
         'distance_metric': 'hamming',  # 'hamming' hoặc 'lee'
         'test': False,              # True để chạy test (không lưu Excel)
         'validate': False,          # True để kiểm tra khoảng cách
+        'maxsat': False,            # True để sử dụng MaxSAT RC2 solver
         'multi_sat': False,         # True để sử dụng multi-SAT solver
         'incremental': False,       # True để sử dụng incremental multi-SAT (giữ learned clauses)
-        'max_iterations': 50,       # Số lần lặp tối đa cho multi-SAT
         'timeout': 600,             # Giới hạn thời gian cho mỗi lần giải SAT (giây)
-        'max_timeout_retries': 1    # Số lần thử lại tối đa khi timeout
+        'max_timeout_retries': 0    # Số lần thử lại tối đa khi timeout
     }
     
     # Override config với command line arguments nếu có
@@ -1206,9 +1833,9 @@ if __name__ == "__main__":
     parser.add_argument("--metric", type=str, choices=["hamming", "lee"], help=f"Distance metric (default: {config['distance_metric']})")
     parser.add_argument("--test", action="store_true", help="Run in test mode (no Excel saving)")
     parser.add_argument("--validate", action="store_true", help="Validate codeword distances")
+    parser.add_argument("--maxsat", action="store_true", help="Use MaxSAT solver with RC2 to maximize active codewords")
     parser.add_argument("--multi-sat", action="store_true", help="Use multi-SAT solver to find maximum codewords")
     parser.add_argument("--incremental", action="store_true", help="Use incremental multi-SAT solver (preserves learned clauses between iterations)")
-    parser.add_argument("--max-iterations", type=int, help=f"Maximum iterations for multi-SAT (default: {config['max_iterations']})")
     parser.add_argument("--timeout", type=int, help=f"Time limit in seconds for each SAT solve (default: {config['timeout']})")
     parser.add_argument("--max-timeout-retries", type=int, help=f"Maximum retries when timeout occurs (default: {config['max_timeout_retries']})")
     
@@ -1230,12 +1857,12 @@ if __name__ == "__main__":
         final_config['test'] = args.test
     if args.validate:
         final_config['validate'] = args.validate
+    if args.maxsat:
+        final_config['maxsat'] = args.maxsat
     if args.multi_sat:
         final_config['multi_sat'] = args.multi_sat
     if args.incremental:
         final_config['incremental'] = args.incremental
-    if args.max_iterations is not None:
-        final_config['max_iterations'] = args.max_iterations
     if args.timeout is not None:
         final_config['timeout'] = args.timeout
     if hasattr(args, 'max_timeout_retries') and args.max_timeout_retries is not None:
@@ -1243,6 +1870,13 @@ if __name__ == "__main__":
 
     if final_config['alphabet_size'] < 2:
         raise ValueError("--q must be >= 2")
+
+    selected_modes = sum(
+        bool(final_config[mode_name])
+        for mode_name in ('maxsat', 'multi_sat', 'incremental')
+    )
+    if selected_modes > 1:
+        raise ValueError("Choose at most one of --maxsat, --multi-sat, or --incremental")
     
     # Execute appropriate solver
     if final_config['incremental']:
@@ -1254,9 +1888,19 @@ if __name__ == "__main__":
             distance_metric=final_config['distance_metric'],
             test=final_config['test'],
             validate=final_config['validate'],
-            max_iterations=final_config['max_iterations'],
             timeout=final_config['timeout'],
             max_timeout_retries=final_config['max_timeout_retries']
+        )
+    elif final_config['maxsat']:
+        solve_flecc_maxsat(
+            length_of_codeword=final_config['length_of_codeword'],
+            distance_threshold=final_config['distance_threshold'],
+            number_of_codewords=final_config['number_of_codewords'],
+            alphabet_size=final_config['alphabet_size'],
+            distance_metric=final_config['distance_metric'],
+            test=final_config['test'],
+            validate=final_config['validate'],
+            timeout=final_config['timeout']
         )
     elif final_config['multi_sat']:
         solve_flecc_multi_sat(
@@ -1267,7 +1911,6 @@ if __name__ == "__main__":
             distance_metric=final_config['distance_metric'],
             test=final_config['test'],
             validate=final_config['validate'],
-            max_iterations=final_config['max_iterations'],
             timeout=final_config['timeout'],
             max_timeout_retries=final_config['max_timeout_retries']
         )
