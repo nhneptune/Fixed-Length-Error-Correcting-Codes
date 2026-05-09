@@ -42,6 +42,7 @@ Usage (standalone):
 """
 
 import argparse
+import gc
 import math
 import os
 import timeit
@@ -49,6 +50,17 @@ import timeit
 import gurobipy as gp
 from gurobipy import GRB
 import pandas as pd
+
+
+from flecc_with_sat import (
+    FleccWithSatIncremental,
+    solve_with_timeout,
+    get_cp_mip_c_multiplier_placeholder,
+    compute_upper_bound_max_possible_codewords,
+    append_results_to_excel_by_metric_sheet,
+    append_summary_to_excel,
+    validate_codewords,
+)
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -211,79 +223,85 @@ def _make_distance_callback(y, x, z_h, z_l, n: int, q: int, d: int, M_ub: int, m
         if where != GRB.Callback.MIPSOL:
             return
 
-        y_vals = model.cbGetSolution(list(y.values()))
-        active = [i for i in range(M_ub) if y_vals[i] > 0.5]
-        if len(active) < 2:
-            return
+        try:
+            y_vals = model.cbGetSolution(list(y.values()))
+            active = [i for i in range(M_ub) if y_vals[i] > 0.5]
+            if len(active) < 2:
+                return
 
-        # Batch-fetch x values for active codewords only
-        x_keys = [(i, j, k) for i in active for j in range(n) for k in symbols]
-        x_flat = model.cbGetSolution([x[key] for key in x_keys])
-        x_val  = dict(zip(x_keys, x_flat))
+            # Batch-fetch x values for active codewords only
+            x_keys = [(i, j, k) for i in active for j in range(n) for k in symbols]
+            x_flat = model.cbGetSolution([x[key] for key in x_keys])
+            x_val  = dict(zip(x_keys, x_flat))
 
-        # Decode chosen symbol at each (codeword, position)
-        sym = {}
-        for i in active:
-            for j in range(n):
-                for k in symbols:
-                    if x_val[i, j, k] > 0.5:
-                        sym[i, j] = k
-                        break
+            # Decode chosen symbol at each (codeword, position)
+            sym = {}
+            for i in active:
+                for j in range(n):
+                    for k in symbols:
+                        if x_val[i, j, k] > 0.5:
+                            sym[i, j] = k
+                            break
 
-        for idx1 in range(len(active)):
-            for idx2 in range(idx1 + 1, len(active)):
-                i1, i2 = active[idx1], active[idx2]
+            for idx1 in range(len(active)):
+                for idx2 in range(idx1 + 1, len(active)):
+                    i1, i2 = active[idx1], active[idx2]
 
-                # Compute current distance
-                if metric == "hamming":
-                    dist = sum(1 for j in range(n) if sym.get((i1, j)) != sym.get((i2, j)))
-                else:
-                    dist = sum(lee_delta(sym[i1, j], sym[i2, j], q) for j in range(n))
+                    # Compute current distance
+                    if metric == "hamming":
+                        dist = sum(1 for j in range(n) if sym.get((i1, j)) != sym.get((i2, j)))
+                    else:
+                        dist = sum(lee_delta(sym[i1, j], sym[i2, j], q) for j in range(n))
 
-                if dist >= d:
-                    continue  # fine
+                    if dist >= d:
+                        continue  # fine
 
-                if (i1, i2) in added_pairs:
-                    # Full McCormick cuts already added for this pair.
-                    # The incumbent still violates — add a tighter no-good cut
-                    # to cut off this specific point immediately.
-                    lhs = gp.quicksum(
-                        x[i1, j, sym[i1, j]] + x[i2, j, sym[i2, j]]
-                        for j in range(n)
-                    )
-                    rhs = 2 * n - 1 + (2 - y[i1] - y[i2]) * 2 * n
-                    model.cbLazy(lhs <= rhs)
-                    continue
-
-                # First violation for this pair: inject full McCormick + distance cuts
-                added_pairs.add((i1, i2))
-
-                if metric == "hamming":
-                    for j in range(n):
-                        for k in symbols:
-                            z = z_h[i1, i2, j, k]
-                            model.cbLazy(z <= x[i1, j, k])
-                            model.cbLazy(z <= x[i2, j, k])
-                            model.cbLazy(z >= x[i1, j, k] + x[i2, j, k] - 1)
-                    model.cbLazy(
-                        gp.quicksum(z_h[i1, i2, j, k] for j in range(n) for k in symbols)
-                        <= (n - d) + (2 - y[i1] - y[i2]) * n
-                    )
-                else:
-                    for j in range(n):
-                        for k1, k2 in nz_pairs:
-                            z = z_l[i1, i2, j, k1, k2]
-                            model.cbLazy(z <= x[i1, j, k1])
-                            model.cbLazy(z <= x[i2, j, k2])
-                            model.cbLazy(z >= x[i1, j, k1] + x[i2, j, k2] - 1)
-                    model.cbLazy(
-                        gp.quicksum(
-                            delta_cache[k1, k2] * z_l[i1, i2, j, k1, k2]
+                    if (i1, i2) in added_pairs:
+                        # Full McCormick cuts already added for this pair.
+                        # The incumbent still violates — add a tighter no-good cut
+                        # to cut off this specific point immediately.
+                        lhs = gp.quicksum(
+                            x[i1, j, sym[i1, j]] + x[i2, j, sym[i2, j]]
                             for j in range(n)
-                            for k1, k2 in nz_pairs
                         )
-                        >= d - (2 - y[i1] - y[i2]) * d
-                    )
+                        rhs = 2 * n - 1 + (2 - y[i1] - y[i2]) * 2 * n
+                        model.cbLazy(lhs <= rhs)
+                        continue
+
+                    # First violation for this pair: inject full McCormick + distance cuts
+                    added_pairs.add((i1, i2))
+
+                    if metric == "hamming":
+                        for j in range(n):
+                            for k in symbols:
+                                z = z_h[i1, i2, j, k]
+                                model.cbLazy(z <= x[i1, j, k])
+                                model.cbLazy(z <= x[i2, j, k])
+                                model.cbLazy(z >= x[i1, j, k] + x[i2, j, k] - 1)
+                        model.cbLazy(
+                            gp.quicksum(z_h[i1, i2, j, k] for j in range(n) for k in symbols)
+                            <= (n - d) + (2 - y[i1] - y[i2]) * n
+                        )
+                    else:
+                        for j in range(n):
+                            for k1, k2 in nz_pairs:
+                                z = z_l[i1, i2, j, k1, k2]
+                                model.cbLazy(z <= x[i1, j, k1])
+                                model.cbLazy(z <= x[i2, j, k2])
+                                model.cbLazy(z >= x[i1, j, k1] + x[i2, j, k2] - 1)
+                        model.cbLazy(
+                            gp.quicksum(
+                                delta_cache[k1, k2] * z_l[i1, i2, j, k1, k2]
+                                for j in range(n)
+                                for k1, k2 in nz_pairs
+                            )
+                            >= d - (2 - y[i1] - y[i2]) * d
+                        )
+        except Exception as e:
+            print(f"[CALLBACK ERROR] {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            return
 
     return _callback
 
@@ -501,23 +519,60 @@ class FleccWithGurobi:
         self.runtime = timeit.default_timer() - t0
 
         gstat = self.model.Status
+        
+        # Debug: print detailed status
+        print(f"\n[DEBUG] Gurobi Status Code: {gstat}")
+        print(f"        SolCount: {self.model.SolCount}")
+        if self.model.SolCount > 0:
+            print(f"        ObjVal: {self.model.ObjVal}")
+        
         if gstat == GRB.OPTIMAL:
             self.status = "Optimal"
         elif gstat == GRB.TIME_LIMIT and self.model.SolCount > 0:
             self.status = "Feasible"
         elif gstat == GRB.INFEASIBLE:
             self.status = "Infeasible"
+        elif gstat == GRB.UNBOUNDED:
+            self.status = "Unbounded"
+            print("        ⚠ Model is UNBOUNDED (mục tiêu tăng vô hạn)")
+        elif gstat == GRB.INF_OR_UNBD:
+            self.status = "Inf_or_Unbd"
+            print("        ⚠ Model either INFEASIBLE or UNBOUNDED")
+        elif gstat == GRB.INTERRUPTED:
+            self.status = "Interrupted"
+            print("        ⚠ Solver was INTERRUPTED")
+        elif gstat == GRB.ITERATION_LIMIT:
+            self.status = "IterationLimit"
+            print("        ⚠ Hit ITERATION LIMIT")
+        elif gstat == GRB.NODE_LIMIT:
+            self.status = "NodeLimit"
+            print("        ⚠ Hit NODE LIMIT")
+        elif gstat == GRB.TIME_LIMIT:
+            self.status = "TimeLimit_NoSol"
+            print("        ⚠ Hit TIME LIMIT (không tìm được giải pháp)")
         else:
             self.status = "Unknown"
+            print(f"        ⚠ UNKNOWN status code: {gstat}")
 
         if self.model.SolCount > 0:
             self.obj_val  = int(round(self.model.ObjVal))
             self.solution = self._extract_solution()
         else:
-            self.obj_val  = None
+            self.obj_val  = 0
             self.solution = None
 
         return self.status, self.obj_val, self.solution, self.runtime
+
+    def cleanup(self):
+        """Dispose of the Gurobi model and release license."""
+        if self.model is not None:
+            try:
+                self.model.dispose()
+            except Exception:
+                pass
+            self.model = None
+        # Force garbage collection to release Gurobi resources
+        gc.collect()
 
     # ── Private model-building helpers ────────────────────────────────────────
 
@@ -604,6 +659,26 @@ class FleccWithGurobi:
 
                     eq_prev = eq_next
 
+        # ── (3) Global lexicographic order by numerical value ─────────────
+        # val[i] = sum_{j=0}^{n-1} q^{n-1-j} * sum_{k=0}^{q-1} k * x[i,j,k]
+        # This represents the codeword as a base-q number.
+        # Constraint: val[i] <= val[i+1] + (1 - y[i+1]) * big_M
+        # Where big_M = q^n ensures the constraint is inactive when y[i+1] = 0.
+        val = m.addVars(M_ub, vtype=GRB.INTEGER, name="val")
+        big_M = q ** n
+        for i in range(M_ub):
+            val_expr = gp.quicksum(
+                (q ** (n - 1 - j)) * gp.quicksum(k * x[i, j, k] for k in symbols)
+                for j in range(n)
+            )
+            m.addConstr(val[i] == val_expr, name=f"ValDef_{i}")
+        
+        for i in range(M_ub - 1):
+            m.addConstr(
+                val[i] <= val[i + 1] + (1 - y[i + 1]) * big_M,
+                name=f"ValLex_{i}"
+            )
+
     def _extract_solution(self):
         """Read selected codeword strings from the solved model."""
         solution = []
@@ -631,9 +706,13 @@ def solve_flecc_gurobi(
     time_limit: float = 600.0,
     output_file: str = DEFAULT_OUTPUT_FILE,
     test: bool = False,
+    instance_name: str = "",
 ):
     """
     Solve one FLECC instance with Gurobi and optionally write results to Excel.
+
+    Instance names are either passed in or auto-generated in the format: FLECC_n_q_d
+    to match the SAT solver naming convention.
 
     Parameters
     ----------
@@ -646,6 +725,8 @@ def solve_flecc_gurobi(
     time_limit : solver wall-clock budget in seconds  (None = unlimited)
     output_file: path to Excel output file
     test       : if True, skip all Excel I/O
+    instance_name : str or ""
+        Custom instance name for Excel. If empty, auto-generates FLECC_n_q_d
 
     Returns
     -------
@@ -671,60 +752,67 @@ def solve_flecc_gurobi(
 
     # ── Build model ────────────────────────────────────────────────────────
     solver = FleccWithGurobi(n=n, q=q, d=d, M_ub=M_ub, M_lb=M_lb, metric=metric)
-    solver.build()
+    
+    try:
+        solver.build()
 
-    # ── Solve ──────────────────────────────────────────────────────────────
-    status, obj_val, solution, runtime = solver.solve(time_limit=time_limit)
+        # ── Solve ──────────────────────────────────────────────────────────
+        status, obj_val, solution, runtime = solver.solve(time_limit=time_limit)
 
-    # ── Console report ─────────────────────────────────────────────────────
-    print(f"\nStatus  : {status}")
-    print(f"Best M  : {obj_val}")
-    print(f"Runtime : {runtime:.4f}s")
-    if solution:
-        print(f"Codewords ({len(solution)}):")
-        for cw in solution:
-            print(f"  {cw}")
+        # ── Console report ─────────────────────────────────────────────────
+        print(f"\nStatus  : {status}")
+        print(f"Best M  : {obj_val}")
+        print(f"Runtime : {runtime:.4f}s")
+        if solution:
+            print(f"Codewords ({len(solution)}):")
+            for cw in solution:
+                print(f"  {cw}")
 
-    # ── Build result row ───────────────────────────────────────────────────
-    instance_name = f"FLECC_{n}_{d}_{metric}_q{q}_gurobi"
-    result_row = {
-        "Instance":  instance_name,
-        "n":         n,
-        "q":         q,
-        "d":         d,
-        "Metric":    metric,
-        "M_lb":      M_lb,
-        "M_ub":      M_ub,
-        "M_best":    obj_val,
-        "Status":    status,
-        "Runtime(s)": round(runtime, 4),
-        "Codewords": str(solution) if solution else "None",
-        "Method":    "ILP-Gurobi",
-    }
-
-    # ── Save to Excel ──────────────────────────────────────────────────────
-    if not test:
-        results_df = pd.DataFrame([result_row])
-        sheet = _append_df_to_excel_sheet(output_file, results_df, metric)
-        print(f"\nResults saved  → {output_file}  (sheet: {sheet})")
-
-        summary_row = {
-            "Instance": instance_name,
-            "n":        n,
-            "q":        q,
-            "d":        d,
-            "M_best":   obj_val,
-            "UB":       M_ub,
-            "Time(s)":  round(runtime, 4),
-            "Status":   status,
-            "Method":   "ILP-Gurobi",
+        # ── Build result row ───────────────────────────────────────────────
+        # Use provided instance_name or generate FLECC_n_q_d (to match SAT format)
+        if not instance_name:
+            instance_name = f"FLECC_{n}_{q}_{d}"
+        result_row = {
+            "Instance":  instance_name,
+            "n":         n,
+            "q":         q,
+            "d":         d,
+            "Metric":    metric,
+            "M_lb":      M_lb,
+            "M_ub":      M_ub,
+            "M_best":    obj_val,
+            "Status":    status,
+            "Runtime(s)": round(runtime, 4),
+            "Codewords": str(solution) if solution else "None",
+            "Method":    "ILP-Gurobi",
         }
-        s_sheet = _append_df_to_excel_sheet(
-            DEFAULT_SUMMARY_FILE, pd.DataFrame([summary_row]), metric
-        )
-        print(f"Summary saved  → {DEFAULT_SUMMARY_FILE}  (sheet: {s_sheet})")
 
-    return status, obj_val, solution, result_row
+        # ── Save to Excel ──────────────────────────────────────────────────
+        if not test:
+            results_df = pd.DataFrame([result_row])
+            sheet_name = append_results_to_excel_by_metric_sheet(output_file, results_df, metric)
+            print(f"\nResults saved  → {output_file}  (sheet: {sheet_name})")
+
+            summary_row = {
+                "Instance": instance_name,
+                "n":        n,
+                "q":        q,
+                "d":        d,
+                "M_best":   obj_val,
+                "UB":       M_ub,
+                "Time(s)":  round(runtime, 4),
+                "Status":   status,
+                "Method":   "ILP-Gurobi",
+            }
+            summary_file, s_sheet = append_summary_to_excel(summary_row, metric)
+            print(f"Summary saved  → {summary_file}  (sheet: {s_sheet})")
+
+        return status, obj_val, solution, result_row
+    
+    finally:
+        # Always cleanup Gurobi resources
+        solver.cleanup()
+        gc.collect()  # Force garbage collection
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────

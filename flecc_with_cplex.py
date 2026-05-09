@@ -45,6 +45,17 @@ import cplex
 import pandas as pd
 
 
+from flecc_with_sat import (
+    FleccWithSatIncremental,
+    solve_with_timeout,
+    get_cp_mip_c_multiplier_placeholder,
+    compute_upper_bound_max_possible_codewords,
+    append_results_to_excel_by_metric_sheet,
+    append_summary_to_excel,
+    validate_codewords,
+)
+
+
 # --- Constants ----------------------------------------------------------------
 
 DEFAULT_OUTPUT_FILE  = "FLECC_CPLEX.xlsx"
@@ -357,7 +368,7 @@ class FleccWithCplex:
         # Populated by build() / solve()
         self._prob    = None   # cplex.Cplex instance
         self.solution = None   # list of codeword strings, or None
-        self.obj_val  = None   # best M found (int), or None
+        self.obj_val  = None   # best M found (int), or 0
         self.status   = None   # "Optimal" | "Feasible" | "Infeasible" | "Unknown"
         self.runtime  = None   # wall-clock seconds (float)
 
@@ -527,7 +538,7 @@ class FleccWithCplex:
             self.obj_val  = int(round(sol.get_objective_value()))
             self.solution = self._extract_solution()
         else:
-            self.obj_val  = None
+            self.obj_val  = 0
             self.solution = None
 
         return self.status, self.obj_val, self.solution, self.runtime
@@ -925,9 +936,13 @@ def solve_flecc_cplex(
     time_limit: float = 600.0,
     output_file: str = DEFAULT_OUTPUT_FILE,
     test: bool = False,
+    instance_name: str = "",
 ):
     """
     Solve one FLECC instance with CPLEX and optionally write results to Excel.
+
+    Instance names are either passed in or auto-generated in the format: FLECC_n_q_d
+    to match the SAT solver naming convention.
 
     Parameters
     ----------
@@ -940,6 +955,8 @@ def solve_flecc_cplex(
     time_limit : solver wall-clock budget in seconds  (None = unlimited)
     output_file: path to Excel output file
     test       : if True, skip all Excel I/O
+    instance_name : str or ""
+        Custom instance name for Excel. If empty, auto-generates FLECC_n_q_d
 
     Returns
     -------
@@ -983,7 +1000,8 @@ def solve_flecc_cplex(
             print(f"  {cw}")
 
     # -- Build result row ---------------------------------------------------
-    instance_name = f"FLECC_{n}_{d}_{metric}_q{q}_cplex"
+    if not instance_name:
+        instance_name = f"FLECC_{n}_{q}_{d}"
     result_row = {
         "Instance":   instance_name,
         "n":          n,
@@ -1002,8 +1020,8 @@ def solve_flecc_cplex(
     # -- Save to Excel ------------------------------------------------------
     if not test:
         results_df = pd.DataFrame([result_row])
-        sheet = _append_df_to_excel_sheet(output_file, results_df, metric)
-        print(f"\nResults saved  -> {output_file}  (sheet: {sheet})")
+        sheet_name = append_results_to_excel_by_metric_sheet(output_file, results_df, metric)
+        print(f"\nResults saved  -> {output_file}  (sheet: {sheet_name})")
 
         summary_row = {
             "Instance": instance_name,
@@ -1016,10 +1034,8 @@ def solve_flecc_cplex(
             "Status":   status,
             "Method":   "ILP-CPLEX",
         }
-        s_sheet = _append_df_to_excel_sheet(
-            DEFAULT_SUMMARY_FILE, pd.DataFrame([summary_row]), metric
-        )
-        print(f"Summary saved  -> {DEFAULT_SUMMARY_FILE}  (sheet: {s_sheet})")
+        summary_file, s_sheet = append_summary_to_excel(summary_row, metric)
+        print(f"Summary saved  -> {summary_file}  (sheet: {s_sheet})")
 
     return status, obj_val, solution, result_row
 
@@ -1104,7 +1120,7 @@ def solve_flecc_cplex_incremental(
 
         if status == "Infeasible":
             # CPLEX proved M is truly infeasible -> M-1 is the optimal answer
-            final_status = "Optimal" if best_M is not None else "Infeasible"
+            final_status = "Optimal" if best_M != 0 else "Infeasible"
             break
         elif status in ("Optimal", "Feasible") and obj_val is not None and obj_val >= M:
             best_M        = M
@@ -1116,15 +1132,15 @@ def solve_flecc_cplex_incremental(
             # Conservative: report best_M so far as a lower bound
             print(f"  [M={M}] Time limit hit without finding a solution — "
                   f"cannot determine if M={M} is feasible.")
-            final_status = "Feasible" if best_M is not None else "Infeasible"
+            final_status = "Feasible" if best_M != 0 else "Infeasible"
             break
         else:
             # Unexpected: solver found fewer codewords than M
-            final_status = "Feasible" if best_M is not None else "Infeasible"
+            final_status = "Feasible" if best_M != 0 else "Infeasible"
             break
     else:
         # Completed all M values without proving M_ub+1 infeasible
-        final_status = "Optimal" if best_M is not None else "Infeasible"
+        final_status = "Optimal" if best_M != 0 else "Infeasible"
 
     total_runtime = timeit.default_timer() - global_start
 
@@ -1158,8 +1174,8 @@ def solve_flecc_cplex_incremental(
     # -- Save to Excel ------------------------------------------------------
     if not test:
         results_df = pd.DataFrame([result_row])
-        sheet = _append_df_to_excel_sheet(output_file, results_df, metric)
-        print(f"\nResults saved  -> {output_file}  (sheet: {sheet})")
+        sheet_name = append_results_to_excel_by_metric_sheet(output_file, results_df, metric)
+        print(f"\nResults saved  -> {output_file}  (sheet: {sheet_name})")
 
         summary_row = {
             "Instance": instance_name,
@@ -1172,9 +1188,7 @@ def solve_flecc_cplex_incremental(
             "Status":   final_status,
             "Method":   "ILP-CPLEX-Incremental",
         }
-        s_sheet = _append_df_to_excel_sheet(
-            DEFAULT_SUMMARY_FILE, pd.DataFrame([summary_row]), metric
-        )
+        summary_file, s_sheet = append_summary_to_excel(summary_row, metric)
         print(f"Summary saved  -> {DEFAULT_SUMMARY_FILE}  (sheet: {s_sheet})")
 
     return final_status, best_M, best_solution, result_row
@@ -1208,12 +1222,12 @@ def main():
     parser.add_argument(
         "--strategy",
         type=str,
-        default="incremental",
+        default="direct",
         choices=["incremental", "direct"],
         help=(
             "incremental: linear search M=M_lb...M_ub, each sub-problem has exactly M "
-            "slots (recommended, much faster for Lee).  "
-            "direct: single maximisation solve over M_ub candidate slots."
+            "slots.  "
+            "direct: single maximisation solve over M_ub candidate slots (default, fast)."
         ),
     )
 

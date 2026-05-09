@@ -497,11 +497,11 @@ def solve_flecc_multi_sat_incremental_snakelex(
             "n": length_of_codeword,
             "q": alphabet_size,
             "d": distance_threshold,
-            "M_best": max_codewords_found,
+            "M_best": max_codewords_found if max_codewords_found is not None else 0,
             "UB": ub_max_possible_codewords,
             "Time(s)": round(timeit.default_timer() - global_start, 4),
             "Status": summary_status,
-            "Vars": best_solution["variables_count"] if best_solution else None,
+            "Vars": best_solution["variables_count"] if best_solution else flecc_solver.variables_count,
             "Method": "Incremental_SnakeLex",
         }
         summary_file, sheet_name = append_summary_to_excel(
